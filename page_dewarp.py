@@ -16,12 +16,10 @@ import cv2
 from PIL import Image
 import numpy as np
 import scipy.optimize
+import argparse
 
 # for some reason pylint complains about cv2 members being undefined :(
 # pylint: disable=E1101
-
-PAGE_MARGIN_X = 50       # reduced px to ignore near L/R edge
-PAGE_MARGIN_Y = 20       # reduced px to ignore near T/B edge
 
 OUTPUT_ZOOM = 1.0        # how much to zoom output relative to *original* image
 OUTPUT_DPI = 300         # just affects stated DPI of PNG, not appearance
@@ -32,7 +30,6 @@ ADAPTIVE_WINSZ = 55      # window size for adaptive threshold in reduced px
 TEXT_MIN_WIDTH = 15      # min reduced px width of detected text contour
 TEXT_MIN_HEIGHT = 2      # min reduced px height of detected text contour
 TEXT_MIN_ASPECT = 1.5    # filter out text contours below this w/h ratio
-TEXT_MAX_THICKNESS = 10  # max reduced px thickness of detected text contour
 
 EDGE_MAX_OVERLAP = 1.0   # max reduced px horiz. overlap of contours in span
 EDGE_MAX_LENGTH = 100.0  # max reduced px length of edge connecting contours
@@ -43,9 +40,12 @@ RVEC_IDX = slice(0, 3)   # index of rvec in params vector
 TVEC_IDX = slice(3, 6)   # index of tvec in params vector
 CUBIC_IDX = slice(6, 8)  # index of cubic slopes in params vector
 
-SPAN_MIN_WIDTH = 30      # minimum reduced px width for span
+SPAN_MIN_WIDTH = 100      # minimum reduced px width for span
 SPAN_PX_PER_STEP = 20    # reduced px spacing for sampling along spans
 FOCAL_LENGTH = 1.2       # normalized focal length of camera
+
+SLICE_WIDTH = 25
+SLICE_GAP = 2
 
 DEBUG_LEVEL = 0          # 0=none, 1=some, 2=lots, 3=all
 DEBUG_OUTPUT = 'file'    # file, screen, both
@@ -95,7 +95,6 @@ def debug_show(name, step, text, display):
         cv2.imwrite(outfile, display)
 
     if DEBUG_OUTPUT != 'file':
-
         image = display.copy()
         height = image.shape[0]
 
@@ -233,8 +232,10 @@ def project_keypoints(pvec, keypoint_index):
     return project_xy(xy_coords, pvec)
 
 
-def resize_to_screen(src, maxw=1280, maxh=700, copy=False):
+def resize_to_screen(src, maxw=None, maxh=None, slice_enabled=False, copy=False):
 
+    maxw = maxw
+    maxh = maxh
     height, width = src.shape[:2]
 
     scl_x = float(width)/maxw
@@ -250,6 +251,10 @@ def resize_to_screen(src, maxw=1280, maxh=700, copy=False):
     else:
         img = src
 
+    if slice_enabled:
+        for i in range(1,int(src.shape[1]/SLICE_WIDTH)):
+            img[:, (i*SLICE_WIDTH):(i*SLICE_WIDTH+SLICE_GAP)] = 255.0
+
     return img
 
 
@@ -257,14 +262,14 @@ def box(width, height):
     return np.ones((height, width), dtype=np.uint8)
 
 
-def get_page_extents(small):
+def get_page_extents(small, page_margin_x, page_margin_y):
 
     height, width = small.shape[:2]
 
-    xmin = PAGE_MARGIN_X
-    ymin = PAGE_MARGIN_Y
-    xmax = width-PAGE_MARGIN_X
-    ymax = height-PAGE_MARGIN_Y
+    xmin = page_margin_x
+    ymin = page_margin_y
+    xmax = width - page_margin_x
+    ymax = height - page_margin_y
 
     page = np.zeros((height, width), dtype=np.uint8)
     cv2.rectangle(page, (xmin, ymin), (xmax, ymax), (255, 255, 255), -1)
@@ -278,7 +283,7 @@ def get_page_extents(small):
     return page, outline
 
 
-def get_mask(name, small, pagemask, masktype):
+def get_mask(name, small, pagemask, masktype, threshold_c=25):
 
     sgray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
 
@@ -287,7 +292,7 @@ def get_mask(name, small, pagemask, masktype):
         mask = cv2.adaptiveThreshold(sgray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                      cv2.THRESH_BINARY_INV,
                                      ADAPTIVE_WINSZ,
-                                     25)
+                                     threshold_c)
 
         if DEBUG_LEVEL >= 3:
             debug_show(name, 0.1, 'thresholded', mask)
@@ -307,7 +312,7 @@ def get_mask(name, small, pagemask, masktype):
         mask = cv2.adaptiveThreshold(sgray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                      cv2.THRESH_BINARY_INV,
                                      ADAPTIVE_WINSZ,
-                                     7)
+                                     threshold_c)
 
         if DEBUG_LEVEL >= 3:
             debug_show(name, 0.4, 'thresholded', mask)
@@ -347,7 +352,8 @@ def blob_mean_and_tangent(contour):
     moments = cv2.moments(contour)
 
     area = moments['m00']
-
+    if area == 0:
+        area = 1;
     mean_x = moments['m10'] / area
     mean_y = moments['m01'] / area
 
@@ -442,9 +448,9 @@ def make_tight_mask(contour, xmin, ymin, width, height):
     return tight_mask
 
 
-def get_contours(name, small, pagemask, masktype):
+def get_contours(name, small, pagemask, masktype, threshold_c, text_max_thickness):
 
-    mask = get_mask(name, small, pagemask, masktype)
+    mask = get_mask(name, small, pagemask, masktype, threshold_c)
 
     _, contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                       cv2.CHAIN_APPROX_NONE)
@@ -463,7 +469,7 @@ def get_contours(name, small, pagemask, masktype):
 
         tight_mask = make_tight_mask(contour, xmin, ymin, width, height)
 
-        if tight_mask.sum(axis=0).max() > TEXT_MAX_THICKNESS:
+        if tight_mask.sum(axis=0).max() > text_max_thickness:
             continue
 
         contours_out.append(ContourInfo(contour, rect, tight_mask))
@@ -481,7 +487,6 @@ def assemble_spans(name, small, pagemask, cinfo_list):
 
     # generate all candidate edges
     candidate_edges = []
-
     for i, cinfo_i in enumerate(cinfo_list):
         for j in range(i):
             # note e is of the form (score, left_cinfo, right_cinfo)
@@ -643,7 +648,7 @@ def visualize_contours(name, small, cinfo_list):
 
     display = small.copy()
     display[mask] = (display[mask]/2) + (regions[mask]/2)
-
+    
     for j, cinfo in enumerate(cinfo_list):
         color = CCOLORS[j % len(CCOLORS)]
         color = tuple([c/4 for c in color])
@@ -778,7 +783,7 @@ def get_page_dims(corners, rough_dims, params):
     return dims
 
 
-def remap_image(name, img, small, page_dims, params):
+def remap_image(name, img, small, page_dims, params, adaptive_winsz, output_directory):
 
     height = 0.5 * page_dims[1] * OUTPUT_ZOOM * img.shape[0]
     height = round_nearest_multiple(height, REMAP_DECIMATE)
@@ -820,12 +825,12 @@ def remap_image(name, img, small, page_dims, params):
                          None, cv2.BORDER_REPLICATE)
 
     thresh = cv2.adaptiveThreshold(remapped, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                   cv2.THRESH_BINARY, ADAPTIVE_WINSZ, 25)
+                                   cv2.THRESH_BINARY, adaptive_winsz, 25)
 
     pil_image = Image.fromarray(thresh)
     pil_image = pil_image.convert('1')
 
-    threshfile = name + '_thresh.png'
+    threshfile = output_directory + '/' + name + '_thresh.png'
     pil_image.save(threshfile, dpi=(OUTPUT_DPI, OUTPUT_DPI))
 
     if DEBUG_LEVEL >= 1:
@@ -840,19 +845,116 @@ def remap_image(name, img, small, page_dims, params):
 
 def main():
 
-    if len(sys.argv) < 2:
-        print 'usage:', sys.argv[0], 'IMAGE1 [IMAGE2 ...]'
-        sys.exit(0)
+    global DEBUG_LEVEL
+
+    parser = argparse.ArgumentParser(description='Page dewarp')
+
+    parser.add_argument(
+        '--page-margin-x', 
+        metavar='PAGE_MARGIN_X', 
+        required=False, 
+        type=int, 
+        default=50,
+        help='reduced px to ignore near L/R edge'
+    )
+
+    parser.add_argument('--page-margin-y',
+        metavar='PAGE_MARGIN_Y',
+        required=False,
+        type=int,
+        default=20,
+        help='reduced px to ignore near T/B edge'
+    )
+
+    parser.add_argument('--processing-width',
+        metavar='PROCESSING_WIDTH',
+        required=False,
+        type=int,
+        default=1280,
+        help='max width during processing'
+    )
+
+    parser.add_argument('--processing-height',
+        metavar='PROCESSING_HEIGHT',
+        required=False,
+        type=int,
+        default=700,
+        help='max height during processing'
+    )
+
+    parser.add_argument('--text-max-thickness',
+        metavar='TEXT_MAX_THICKNESS',
+        required=False,
+        type=int,
+        default=10,
+        help='max reduced px thickness of detected text contour'
+    )
+
+    parser.add_argument('--line-threshold-c',
+        metavar='LINE_THRESHOLD_C',
+        required=False,
+        type=int,
+        default=7,
+        help='C - Constant subtracted from the mean for adaptive thresholding'
+    )
+
+    parser.add_argument('--adaptive-window-size',
+        metavar='ADAPTIVE_WINSZ',
+        required=False,
+        type=int,
+        default=7,
+        help='Size of a pixel neighborhood that is used to calculate the threshold value'
+    )
+
+    parser.add_argument('--debug',
+        metavar='DEBUG',
+        required=False,
+        type=int, choices=range(0, 4),
+        default=0,
+        help='Debug level (0=none, 1=some, 2=lots, 3=all)'
+    )
+
+    parser.add_argument('--output-directory',
+        metavar='OUTPUT_DIRECTORY',
+        required=False,
+        default='./',
+        type=str,
+        help='output directory for final image'
+    )
+
+    parser.add_argument(
+        '--lines-only', 
+        action='store_true',
+        help='Detect lines only'
+    )
+
+    parser.add_argument(
+        '--slice', 
+        action='store_true',
+        help='Slice image to break up contours'
+    )
+
+    parser.add_argument(
+        'images',
+        metavar='IMAGES',
+        type=str, 
+        nargs='+',
+        help='images to process'
+    )
+
+    args = parser.parse_args()
+
+    DEBUG_LEVEL = args.debug
 
     if DEBUG_LEVEL > 0 and DEBUG_OUTPUT != 'file':
         cv2.namedWindow(WINDOW_NAME)
 
     outfiles = []
 
-    for imgfile in sys.argv[1:]:
+    for imgfile in args.images:
 
         img = cv2.imread(imgfile)
-        small = resize_to_screen(img)
+        small = resize_to_screen(img, args.processing_width, args.processing_height, args.slice)
         basename = os.path.basename(imgfile)
         name, _ = os.path.splitext(basename)
 
@@ -862,14 +964,21 @@ def main():
         if DEBUG_LEVEL >= 3:
             debug_show(name, 0.0, 'original', small)
 
-        pagemask, page_outline = get_page_extents(small)
+        pagemask, page_outline = get_page_extents(small, args.page_margin_x, args.page_margin_y)
 
-        cinfo_list = get_contours(name, small, pagemask, 'text')
-        spans = assemble_spans(name, small, pagemask, cinfo_list)
+        spans = []
+        if not args.lines_only:
 
-        if len(spans) < 3:
-            print '  detecting lines because only', len(spans), 'text spans'
-            cinfo_list = get_contours(name, small, pagemask, 'line')
+            cinfo_list = get_contours(name, small, pagemask, 'text', 25, args.text_max_thickness)
+            spans = assemble_spans(name, small, pagemask, cinfo_list)
+
+            if len(spans) < 3:
+                print '  detecting lines because only', len(spans), 'text spans'
+        else:
+            print '  detecting lines only'
+
+        if args.lines_only or len(spans) < 3:
+            cinfo_list = get_contours(name, small, pagemask, 'line', args.line_threshold_c, args.text_max_thickness)
             spans2 = assemble_spans(name, small, pagemask, cinfo_list)
             if len(spans2) > len(spans):
                 spans = spans2
@@ -900,7 +1009,15 @@ def main():
 
         page_dims = get_page_dims(corners, rough_dims, params)
 
-        outfile = remap_image(name, img, small, page_dims, params)
+        outfile = remap_image(
+            name, 
+            img, 
+            small, 
+            page_dims, 
+            params, 
+            args.adaptive_window_size, 
+            args.output_directory
+        )
 
         outfiles.append(outfile)
 
